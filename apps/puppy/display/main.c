@@ -2,10 +2,11 @@
  *
  * The frames are 144x144 (see tools/sprite_convert.py) and sit on the
  * bottom of the 320x240 panel, leaving the 24px the three-step jump
- * needs. Idle bobs. BLUE is the stand-in for another badge being near:
- * the excited frame jumps up in three steps, a three-note beep plays,
- * and the seven LEDs ripple out from the center. Back to idle after
- * three seconds.
+ * needs. Idle bobs. Another badge being near -- PUP_MSG_NEAR from the
+ * main CPU's radio, or BLUE as a stand-in -- runs on_peer_near(): the
+ * excited frame jumps up in three steps, a three-note beep plays, and the
+ * seven LEDs ripple out from the center. Back to idle after three seconds.
+ * NEAR cuts off any sound already playing; BLUE waits for it, as before.
  *
  * GREEN plays a rising C5-E5-G5-C6 success arpeggio (~0.8 s), holds the
  * excited frame, and flashes the LEDs green. A short RED press plays a
@@ -18,7 +19,9 @@
  * them big-endian). Speaker: there is no beep() call. i2s_audio_start()
  * plays a buffer this file synthesizes once, at the driver's 8000 Hz rate.
  */
+#include <string.h>
 #include "fwog_display.h"
+#include "puppy_link.h"
 #include "puppy_sprites.h"
 #include "hardware/pio.h"
 #include "pico/stdlib.h"
@@ -91,6 +94,9 @@ static int16_t s_minor[MINOR_SAMPLES];
 static bool s_lcd;
 static bool s_leds;
 static bool s_audio;
+static bool s_link;
+/* ~4.2 KB: static, not on the stack. */
+static fwog_link_rx_t s_link_rx;
 
 static unsigned s_pose;
 static uint32_t s_jump_ms;
@@ -202,13 +208,32 @@ static bool play(const int16_t *buf, unsigned n, const char *name) {
     return started;
 }
 
-/* BLUE passes 0, 0. peer_id and closeness are unused stand-in arguments. */
-static void on_peer_near(uint8_t peer_id, int8_t closeness) {
+/* The one "another badge is near" reaction. BLUE passes 0, 0. */
+static void on_peer_near(uint16_t peer_id, int rssi_dbm) {
     s_pose = POSE_JUMP;
     s_jump_ms = to_ms_since_boot(get_absolute_time());
     s_ripple = 0xFFu;
-    DIAG("[puppy] state=jump peer=%u closeness=%d\n", (unsigned)peer_id, (int)closeness);
+    DIAG("[puppy] state=jump peer=%04x rssi=%d\n", (unsigned)peer_id, rssi_dbm);
     (void)play(s_beep, BEEP_SAMPLES, "beep");
+}
+
+static void link_poll(void) {
+    if (!s_link) return;
+    uint8_t b;
+    size_t len;
+    while (fwog_link_uart_read(&b)) {
+        if (!fwog_link_rx_byte(&s_link_rx, b, &len)) continue;
+        const uint8_t *p = s_link_rx.buf;
+        if (len == sizeof(pup_msg_near_t) && p[0] == PUP_MSG_NEAR) {
+            pup_msg_near_t m;
+            memcpy(&m, p, sizeof m);
+            DIAG("[puppy] NEAR from %04x rssi=%d\n", (unsigned)m.peer_id, (int)m.rssi_dbm);
+            if (sound_busy()) i2s_audio_stop();
+            on_peer_near(m.peer_id, m.rssi_dbm);
+        } else {
+            (void)fwog_ioexp_link_handle(p, len);  /* the BSP's own I/O messages */
+        }
+    }
 }
 
 static void pose(uint32_t now, const uint16_t **frame, uint16_t *y) {
@@ -342,12 +367,23 @@ int main(void) {
     if (s_audio) i2s_audio_set_volume(6);
     else DIAG("[puppy] speaker init failed; no beep\n");
 
+    s_link = fwog_link_uart_init(FWOG_LINK_BAUD);
+    fwog_link_rx_init(&s_link_rx);
+    if (!s_link) DIAG("[puppy] link init failed; only BLUE triggers\n");
+    /* Both paths, because which expander field drives which CC1101 is not
+     * known (tools/ant_sweep.py). */
+    if (!fwog_ioexp_link_set_antennas(PUP_ANTENNA, PUP_ANTENNA))
+        DIAG("[puppy] antenna path write failed\n");
+    DIAG("[puppy] radio %u kHz, antenna path %u\n", (unsigned)(PUP_RADIO_HZ / 1000u),
+         (unsigned)PUP_ANTENNA);
+
     DIAG("[puppy] state=idle\n");
 
     while (true) {
         const uint32_t now = to_ms_since_boot(get_absolute_time());
         const fwog_power_t power = fwog_power_poll(now);
         if (s_audio) i2s_audio_process();
+        link_poll();
 
         const uint8_t pressed = power.buttons.pressed;
         const uint8_t released = power.buttons.released;
