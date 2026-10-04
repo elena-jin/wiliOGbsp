@@ -124,7 +124,12 @@ add_subdirectory(apps/lcd)
 add_subdirectory(apps/bl)
 
 add_subdirectory(apps/template)
-add_subdirectory(apps/button_lights)
+add_subdirectory(apps/puppy)
+# 071d00c adds apps/button_lights, but that directory is not in the tree.
+# Skip only this missing folder so the rest of the apps still configure.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apps/button_lights/CMakeLists.txt")
+    add_subdirectory(apps/button_lights)
+endif()
 add_subdirectory(apps/smoke)
 add_subdirectory(apps/bench)
 add_subdirectory(apps/ogvegas)
